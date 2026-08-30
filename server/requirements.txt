@@ -7,3 +7,7 @@ bcrypt
 websockets
 matplotlib
 seaborn
+redis
+celery
+boto3
+python-dotenv

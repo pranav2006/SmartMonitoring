@@ -5,6 +5,61 @@ from model import Model
 import copy
 import math
 
+def filter_poisoned_clients(client_data: List, global_model_path: str, mode: str = "weights", threshold_multiplier: float = 3.0) -> List:
+    """
+    Filters out extreme outlier/poisoned client updates dynamically using Median Absolute Deviation (MAD).
+    Allows genuine variance by targeting Z-scores higher than threshold_multiplier.
+    """
+    if len(client_data) <= 2:
+        return client_data # Need at least 3 clients for reliable median/MAD statistics
+        
+    norms = []
+    
+    if mode == "weights":
+        global_model = Model()
+        global_model.model.load_weights(global_model_path)
+        global_weights = global_model.model.get_weights()
+        
+        for item in client_data:
+            model_path = item[0]
+            local_model = Model()
+            local_model.model.load_weights(model_path)
+            local_weights = local_model.model.get_weights()
+            
+            diffs = [lw - gw for lw, gw in zip(local_weights, global_weights)]
+            flat_diff = np.concatenate([d.flatten() for d in diffs])
+            norms.append(float(np.linalg.norm(flat_diff)))
+            
+    elif mode == "gradients":
+        for item in client_data:
+            client_grads = item[0]
+            flat_grad = np.concatenate([g.flatten() for g in client_grads])
+            norms.append(float(np.linalg.norm(flat_grad)))
+            
+    norms = np.array(norms)
+    median_norm = np.median(norms)
+    mad = np.median(np.abs(norms - median_norm))
+    
+    if mad < 1e-8:
+        mad = 1e-8
+        
+    filtered_data = []
+    for idx, item in enumerate(client_data):
+        norm = norms[idx]
+        z_score = (norm - median_norm) / mad
+        client_id = item[3]
+        
+        if z_score > threshold_multiplier:
+            print(f"[POISONING FILTER] Discarded update from client {client_id}: norm={norm:.6f}, median={median_norm:.6f}, Z-score={z_score:.2f}")
+        else:
+            filtered_data.append(item)
+            
+    if len(filtered_data) == 0:
+        print("[POISONING FILTER] Warning: All client updates were filtered out. Falling back to using all updates.")
+        return client_data
+        
+    return filtered_data
+
 class ModelAggregator(ABC):
     @property
     @abstractmethod
@@ -33,11 +88,12 @@ class FedAvg(ModelAggregator):
         
     def aggregate(self, client_data, global_model_path, current_round):
         print("Using FedAvg")
+        client_data = filter_poisoned_clients(client_data, global_model_path, mode="weights")
         global_model = Model()
-        total_samples = sum(samples for _, samples, _, _ in client_data)
+        total_samples = sum(samples for _, samples, *_, _ in client_data)
 
         aggregated_weights = None
-        for model_path, client_samples, _, _ in client_data:
+        for model_path, client_samples, *_, _ in client_data:
             local_model = Model()
             local_model.model.load_weights(model_path)
             local_weights = local_model.model.get_weights()
@@ -60,17 +116,20 @@ class qFedAvg(ModelAggregator):
         return "weights"
 
     def aggregate(self, client_data, global_model_path, current_round):
+        client_data = filter_poisoned_clients(client_data, global_model_path, mode="weights")
         global_model = Model()
         raw_weights = []
 
-        for (model_path, samples, loss, client_id) in client_data:
+        for item in client_data:
+            model_path, samples, loss, client_id = item[0], item[1], item[2], item[3]
             raw_weight = (samples *((loss + 1e-10) ** self.q))
             raw_weights.append(raw_weight)
         total_weight = sum(raw_weights)
         aggregated_weights = None
 
         print("Using qFedAvg")
-        for idx, (model_path, samples, loss, client_id) in enumerate(client_data):
+        for idx, item in enumerate(client_data):
+            model_path, samples, loss, client_id = item[0], item[1], item[2], item[3]
             client_weight = (raw_weights[idx] / total_weight)
             local_model = Model()
             local_model.model.load_weights(model_path)
@@ -112,11 +171,12 @@ class FedFV(ModelAggregator):
         """
         Executes internal/external conflict resolution routines directly on raw gradient lists.
         """
+        client_data = filter_poisoned_clients(client_data, global_model_path, mode="gradients")
         gradients = []
         losses = []
         client_ids = []
         
-        for (client_grads, samples, loss, numeric_id) in client_data:
+        for (client_grads, samples, loss, numeric_id, *_, _) in client_data:
             gradients.append(client_grads)
             losses.append(loss)
             client_ids.append(numeric_id)
@@ -226,15 +286,16 @@ class FedAdam(ModelAggregator):
             global_model.model.save( global_model_path)
             return
 
+        client_data = filter_poisoned_clients(client_data, self.previous_global_model, mode="weights")
         global_model = Model()
         print("Using FedAdam")
 
         global_model.model.load_weights(self.previous_global_model)
         global_weights = (global_model.model.get_weights())
-        total_samples = sum(samples for _, samples, _, _ in client_data)
+        total_samples = sum(samples for _, samples, *_, _ in client_data)
         aggregated_gradient = [np.zeros_like(layer) for layer in global_weights]
 
-        for (model_path,samples,loss,client_id) in client_data:
+        for (model_path,samples,loss,client_id, *_, _) in client_data:
             local_model = Model()
             local_model.model.load_weights(model_path)
             local_weights = (local_model.model.get_weights())
@@ -263,3 +324,174 @@ class FedAdam(ModelAggregator):
         global_model.model.set_weights(new_weights)
         global_model.model.save(global_model_path)
         self.previous_global_model = (global_model_path)
+
+class FedProx(ModelAggregator):
+    """
+    FedProx aggregation strategy with proximal regularization penalty.
+    """
+    def __init__(self, mu: float = 0.01):
+        self.mu = mu
+
+    @property
+    def mode(self):
+        return "weights"
+
+    def aggregate(self, client_data, global_model_path, current_round):
+        print("Using FedProx")
+        client_data = filter_poisoned_clients(client_data, global_model_path, mode="weights")
+        global_model = Model()
+        global_model.model.load_weights(global_model_path)
+        global_weights = global_model.model.get_weights()
+        total_samples = sum(samples for _, samples, *_, _ in client_data)
+
+        if total_samples == 0 or len(client_data) == 0:
+            return
+
+        aggregated_weights = [np.zeros_like(layer) for layer in global_weights]
+        for model_path, client_samples, *_, _ in client_data:
+            local_model = Model()
+            local_model.model.load_weights(model_path)
+            local_weights = local_model.model.get_weights()
+            
+            # Weight sample ratio adjusted by proximal drift penalty
+            drift = sum(np.linalg.norm(lw - gw) for lw, gw in zip(local_weights, global_weights))
+            drift_penalty = 1.0 / (1.0 + self.mu * drift)
+            effective_weight = (client_samples / total_samples) * drift_penalty
+            
+            for i in range(len(local_weights)):
+                aggregated_weights[i] += local_weights[i] * effective_weight
+                
+        global_model.model.set_weights(aggregated_weights)
+        global_model.model.save(global_model_path)
+
+class Krum(ModelAggregator):
+    """
+    Krum / Multi-Krum Byzantine-resilient aggregation strategy.
+    Selects update that minimizes Euclidean distance to its closest neighbors.
+    """
+    def __init__(self, num_byzantine: int = 1):
+        self.num_byzantine = num_byzantine
+
+    @property
+    def mode(self):
+        return "weights"
+
+    def aggregate(self, client_data, global_model_path, current_round):
+        print("Using Krum")
+        client_data = filter_poisoned_clients(client_data, global_model_path, mode="weights")
+        n = len(client_data)
+        if n == 0:
+            return
+        
+        flat_client_weights = []
+        all_local_weights = []
+        for model_path, *_, _ in client_data:
+            local_model = Model()
+            local_model.model.load_weights(model_path)
+            l_weights = local_model.model.get_weights()
+            all_local_weights.append(l_weights)
+            flat = np.concatenate([w.flatten() for w in l_weights])
+            flat_client_weights.append(flat)
+
+        f = min(self.num_byzantine, max(0, (n - 3) // 2))
+        k = max(1, n - f - 2)
+
+        scores = []
+        for i in range(n):
+            distances = []
+            for j in range(n):
+                if i != j:
+                    dist = np.linalg.norm(flat_client_weights[i] - flat_client_weights[j])
+                    distances.append(dist)
+            distances.sort()
+            score = sum(distances[:k])
+            scores.append(score)
+
+        best_idx = int(np.argmin(scores))
+        selected_weights = all_local_weights[best_idx]
+
+        global_model = Model()
+        global_model.model.set_weights(selected_weights)
+        global_model.model.save(global_model_path)
+
+class SCAFFOLD(ModelAggregator):
+    """
+    SCAFFOLD aggregation strategy using control variate variance reduction.
+    """
+    def __init__(self, lr: float = 1.0):
+        self.lr = lr
+        self.c_global = None  # Global control variate
+        self.c_clients = {}   # Dict[client_id, control variate]
+
+    @property
+    def mode(self):
+        return "weights"
+
+    def aggregate(self, client_data, global_model_path, current_round):
+        print("Using SCAFFOLD")
+        client_data = filter_poisoned_clients(client_data, global_model_path, mode="weights")
+        global_model = Model()
+        global_model.model.load_weights(global_model_path)
+        global_weights = global_model.model.get_weights()
+
+        if self.c_global is None:
+            self.c_global = [np.zeros_like(layer) for layer in global_weights]
+
+        n = len(client_data)
+        if n == 0:
+            return
+
+        total_samples = sum(samples for _, samples, *_, _ in client_data)
+        aggregated_weights = [np.zeros_like(layer) for layer in global_weights]
+        delta_c_sum = [np.zeros_like(layer) for layer in global_weights]
+
+        for item in client_data:
+            model_path, samples, loss, cid = item[0], item[1], item[2], item[3]
+            local_model = Model()
+            local_model.model.load_weights(model_path)
+            local_weights = local_model.model.get_weights()
+
+            if cid not in self.c_clients:
+                self.c_clients[cid] = [np.zeros_like(layer) for layer in global_weights]
+
+            c_i = self.c_clients[cid]
+            c_i_new = []
+            for layer_idx in range(len(global_weights)):
+                delta_w = global_weights[layer_idx] - local_weights[layer_idx]
+                c_i_layer = c_i[layer_idx] - self.c_global[layer_idx] + (1.0 / self.lr) * delta_w
+                c_i_new.append(c_i_layer)
+                delta_c_sum[layer_idx] += (c_i_layer - c_i[layer_idx]) / n
+            
+            self.c_clients[cid] = c_i_new
+            client_weight = samples / total_samples
+            for i in range(len(local_weights)):
+                aggregated_weights[i] += local_weights[i] * client_weight
+
+        for i in range(len(global_weights)):
+            self.c_global[i] += delta_c_sum[i]
+
+        global_model.model.set_weights(aggregated_weights)
+        global_model.model.save(global_model_path)
+
+def get_aggregator_by_name(name: str, **kwargs) -> ModelAggregator:
+    """
+    Factory function returning an instance of the requested ModelAggregator strategy.
+    Supported names: 'FedAvg', 'qFedAvg', 'FedFV', 'FedAdam', 'FedProx', 'Krum', 'SCAFFOLD'
+    """
+    name_lower = name.lower()
+    if name_lower == "fedavg":
+        return FedAvg()
+    elif name_lower == "qfedavg":
+        return qFedAvg(q=kwargs.get("q", 0.5))
+    elif name_lower == "fedfv":
+        return FedFV(num_clients=kwargs.get("num_clients", 10))
+    elif name_lower == "fedadam":
+        return FedAdam(lr=kwargs.get("lr", 0.001))
+    elif name_lower == "fedprox":
+        return FedProx(mu=kwargs.get("mu", 0.01))
+    elif name_lower == "krum":
+        return Krum(num_byzantine=kwargs.get("num_byzantine", 1))
+    elif name_lower == "scaffold":
+        return SCAFFOLD(lr=kwargs.get("lr", 1.0))
+    else:
+        raise ValueError(f"Unknown aggregator strategy name: {name}")

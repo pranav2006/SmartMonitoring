@@ -9,27 +9,146 @@ from model import Model
 import argparse
 import asyncio
 import json
+import platform
+import subprocess
+import websockets
+import socket
+import hashlib
+import ssl
+from codecarbon import EmissionsTracker
+import numpy as np
 
-parser = argparse.ArgumentParser()
-parser.add_argument("-d","--dataset", type=str, help="Path to dataset.npz")
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
+def verify_ssl_fingerprint(host: str, port: int, expected_fingerprint: str):
+    """
+    Connects to the server over SSL and verifies that its certificate SHA-256 fingerprint
+    matches expected_fingerprint to prevent Man-in-the-Middle (MitM) attacks.
+    """
+    clean_expected = expected_fingerprint.replace(":", "").lower()
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+
+    with socket.create_connection((host, port), timeout=10) as sock:
+        with ctx.wrap_socket(sock) as ssock:
+            der_cert = ssock.getpeercert(binary_form=True)
+            if not der_cert:
+                raise ssl.SSLError("Server did not present an SSL certificate.")
+            actual_hash = hashlib.sha256(der_cert).hexdigest().lower()
+            if actual_hash != clean_expected:
+                raise ssl.SSLError(
+                    f"SSL Fingerprint Mismatch! Potential MitM Attack Detected.\n"
+                    f"Expected: {clean_expected}\n"
+                    f"Actual:   {actual_hash}"
+                )
+            print(f"[SSL Security] Server certificate SHA-256 fingerprint verified ({actual_hash[:16]}...).")
+            return True
+
+# Argument parsing and environment variable configuration
+parser = argparse.ArgumentParser(description="Federated Learning Client Container")
+parser.add_argument("-d", "--dataset", type=str, required=True, help="Path to the dataset .npz file")
+parser.add_argument("-s", "--server-ip", type=str, default=os.environ.get("SERVER_IP"), help="IP address of the server")
+parser.add_argument("-p", "--password", type=str, default=os.environ.get("PASSWORD"), help="Authentication password")
+parser.add_argument("-c", "--client-id", type=str, default=os.environ.get("CLIENT_ID", "client_0"), help="Unique Client Identifier")
+parser.add_argument("-f", "--fingerprint", type=str, default=os.environ.get("CERT_FINGERPRINT"), help="Expected SHA-256 SSL certificate fingerprint for pinning")
+parser.add_argument("--no-verify", "--insecure", action="store_true", default=os.environ.get("NO_VERIFY", "").lower() in ("true", "1", "yes"), help="Bypass SSL certificate verification")
 args = parser.parse_args()
-training_lock = asyncio.Lock()
-ip = None
-with open("ip.txt", "r") as f:
-    ip = f.read().strip()
-server_url = f"http://{ip}"
-ws_url = f"ws://{ip}/ws/"
+
+# Resolve Server IP
+ip = args.server_ip
+if not ip:
+    if os.path.exists("ip.txt"):
+        with open("ip.txt", "r") as f:
+            ip = f.read().strip()
+    else:
+        ip = "localhost:8000"
+
+# Resolve Server URL and WebSocket URL scheme dynamically
+if "://" in ip:
+    server_url = ip
+    host = ip.split("://")[1]
+    if ip.startswith("https://"):
+        ws_url = f"wss://{host}/ws/"
+    else:
+        ws_url = f"ws://{host}/ws/"
+else:
+    server_url = f"http://{ip}"
+    ws_url = f"ws://{ip}/ws/"
+
+# Execute Certificate Pinning check if fingerprint is provided
+fingerprint = args.fingerprint
+if fingerprint and server_url.startswith("https://"):
+    host_clean = host.split("/")[0]
+    host_ip = host_clean.split(":")[0]
+    port_num = int(host_clean.split(":")[1]) if ":" in host_clean else 443
+    verify_ssl_fingerprint(host_ip, port_num, fingerprint)
+
 os.makedirs('models', exist_ok=True)
 os.makedirs('metrics', exist_ok=True)
-import websockets
-import asyncio
 
+# Force CPU execution to keep simulation uniform and lightweight
 tf.config.set_visible_devices([], 'GPU')
 
-#client specific methods here
+def detect_device_specs():
+    cpu_freq = 2.0e9  # Fallback standard: 2.0 GHz
+    system_name = platform.system()
+    try:
+        if system_name == "Linux":
+            try:
+                with open("/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq", "r") as f:
+                    khz = float(f.read().strip())
+                    cpu_freq = khz * 1e3
+            except Exception:
+                out = subprocess.check_output("lscpu | grep 'CPU max MHz'", shell=True).decode()
+                mhz = float(out.split(":")[-1].strip())
+                cpu_freq = mhz * 1e6
+        elif system_name == "Windows":
+            out = subprocess.check_output("wmic cpu get MaxClockSpeed", shell=True).decode()
+            lines = [line.strip() for line in out.splitlines() if line.strip()]
+            if len(lines) > 1:
+                mhz = float(lines[1])
+                cpu_freq = mhz * 1e6
+        elif system_name == "Darwin":
+            out = subprocess.check_output("sysctl -n hw.cpufreq", shell=True).decode()
+            cpu_freq = float(out.strip())
+    except Exception as e:
+        print(f"[Device Specs] Automated detection failed, utilizing default values: {e}")
+    return {
+        "cpu_frequency": cpu_freq,
+        "tx_power": 0.2
+    }
+
+
+from urllib.parse import urlparse, parse_qs
+
+def extract_s3_key(url: str) -> str:
+    """
+    Extracts the exact S3 object key from a presigned S3 URL or mock S3 URL.
+    """
+    parsed = urlparse(url)
+    query_params = parse_qs(parsed.query)
+    if "key" in query_params:
+        return query_params["key"][0]
+    
+    if ".amazonaws.com/" in url:
+        parts = url.split("?")[0].split(".amazonaws.com/")
+        if len(parts) > 1:
+            return parts[1]
+            
+    return parsed.path.lstrip("/")
+
+
+
 class Client:
-    def __init__(self,filepath):
-        self.client_id = None
+    def __init__(self, filepath, client_id, password=None, no_verify=False):
+        self.client_id = client_id
+        self.password = password
+        self.no_verify = no_verify
         self.authenticate()
         self.current_round = -1
         self.model = Model(filepath)
@@ -37,25 +156,58 @@ class Client:
         self.local_metrics_history = []
         self.global_metrics_history = []
 
-
     def authenticate(self):
-        with open("psswd.txt", "r") as f:
-            psswd = f.read().strip()
-        url = f"{server_url}/"
+        psswd = self.password
+        if not psswd:
+            if os.path.exists("psswd.txt"):
+                with open("psswd.txt", "r") as f:
+                    psswd = f.read().strip()
+            else:
+                print("Error: Authentication password must be provided via -p/--password, PASSWORD env, or psswd.txt file.")
+                sys.exit(1)
+
         try:
-            response = requests.post(url,json=psswd)
-            if response.status_code == 200:
-                auth_info = response.json()
-                self.client_id = auth_info.get("your_id", None)
-                if self.client_id is None:
-                    print("Authentication failed: No client ID received.")
-                    sys.exit(1)
+            # Step 1: Initiate Auth & Get Challenge
+            initiate_url = f"{server_url}/initiate"
+            payload = {"client_id": self.client_id}
+            
+            verify_ssl = not self.no_verify
+            if not verify_ssl:
+                import urllib3
+                urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+                
+            response = requests.post(initiate_url, json=payload, verify=verify_ssl)
+            if response.status_code != 200:
+                print(f"Failed to initiate authentication: {response.status_code} - {response.text}")
+                sys.exit(1)
+                
+            challenge = response.json().get("challenge")
+            if not challenge:
+                print("Authentication failed: No challenge received from server.")
+                sys.exit(1)
+                
+            # Step 2: Compute Cryptographic Response
+            hashed_pwd = hashlib.sha256(psswd.encode('utf-8')).hexdigest()
+            response_hash = hashlib.sha256((hashed_pwd + challenge).encode('utf-8')).hexdigest()
+            
+            # Step 3: Submit Response and specs
+            authenticate_url = f"{server_url}/authenticate"
+            specs = detect_device_specs()
+            auth_payload = {
+                "client_id": self.client_id,
+                "response": response_hash,
+                "specs": specs
+            }
+            
+            auth_response = requests.post(authenticate_url, json=auth_payload, verify=verify_ssl)
+            if auth_response.status_code == 200:
                 print(f"Authenticated successfully. Client ID: {self.client_id}")
             else:
-                print(f"Failed to authenticate: {response.status_code}")
+                print(f"Failed to authenticate: {auth_response.status_code} - {auth_response.text}")
+                sys.exit(1)
         except Exception as e:
             print(f"Error during authentication: {e}")
-
+            sys.exit(1)
 
     def plot_metrics(self):
         import matplotlib.pyplot as plt
@@ -109,157 +261,200 @@ class Client:
         
         print(f"[{self.client_id}] Metric plots saved.")
 
-#methods common to all clients here
-
-def global_metrics():
-    url = f"{server_url}/evaluate"
-    try:
-        response = requests.get(url)
-        if response.status_code == 200:
-            global_metrics = response.json().get("global_metrics", {})
-            print(f"Global evaluation metrics: {global_metrics}")
-            return global_metrics
-        else:
-            print(f"Failed to get global evaluation: {response.status_code}")
-            return None
-    except Exception as e:
-        print(f"Error getting global evaluation: {e}")
-        return None
-
-def get_version():
-    url = f"{server_url}/version"
-    try:
-        response = requests.get(url)
-        if response.status_code == 200:
-            version_info = response.json()
-            return version_info.get("global_round", 0),version_info.get("rounds_left",0)
-        else:
-            print(f"Failed to get version: {response.status_code}")
-            return -1,-1
-    except Exception as e:
-        print(f"Error getting version: {e}")
-        return -1,-1
-
-def download_model(save_path):
-    url = f"{server_url}/download"
-    try:
-        response = requests.get(url)
-        if response.status_code == 200:
-            with open(save_path, 'wb') as f:
-                f.write(response.content)
-            print(f"Global model downloaded successfully.")
-            return True
-        else:
-            print(f"Failed to download model: {response.status_code}")
-            return False
-    except Exception as e:
-        print(f"Error downloading model: {e}")
-        return False
-
-
 
 async def simulate(client):
     try:
-        async with websockets.connect(ws_url+client.client_id, max_size=None) as ws:
+        ssl_context = None
+        if ws_url.startswith("wss://") and client.no_verify:
+            ssl_context = ssl.create_default_context()
+            ssl_context.check_hostname = False
+            ssl_context.verify_mode = ssl.CERT_NONE
+            
+        async with websockets.connect(ws_url + client.client_id, ssl=ssl_context, max_size=None) as ws:
             await ws.send("ready")
             while True:
-                msg = await ws.recv()
-                if msg == "train":
-                    print(f"[{client.client_id}] selected for training")
-                    model_bytes = await ws.recv()
-                    if isinstance(model_bytes, str):
-                        model_bytes = model_bytes.encode('utf-8')
+                msg_text = await ws.recv()
+                event = json.loads(msg_text)
+                command = event.get("command")
+                
+                if command == "train":
+                    print(f"[{client.client_id}] Selected for weights training.")
+                    download_url = event["download_url"]
+                    upload_url = event["upload_url"]
+
+                    # 1. Download global model weights from S3
+                    download_start = time.perf_counter()
+                    response = requests.get(download_url)
+                    response.raise_for_status()
+                    download_latency = time.perf_counter() - download_start
+                    
                     model_path = f"models/global_model_{client.client_id}.keras"
                     with open(model_path, "wb") as f:
-                        f.write(model_bytes)
+                        f.write(response.content)
+                        
                     client.model.model.load_weights(model_path)
                     
-                    async with training_lock:
-                        #added
-                        pre_train_metrics = await asyncio.to_thread(client.model.evaluate)
-                        train_loss = pre_train_metrics["total_loss"]
+                    # Evaluate pre-train metrics
+                    pre_train_metrics = await asyncio.to_thread(client.model.evaluate)
+                    train_loss = pre_train_metrics["total_loss"]
 
-                        await asyncio.to_thread(client.model.train, 1)
-                        client_model_path = f"models/client{client.client_id}_model.keras"
-                        client.model.model.save(client_model_path)
-                        await ws.send("FILE")
-                        await ws.send(str(client.samples))
-                        await ws.send(str(train_loss))
-                        with open(client_model_path, "rb") as f:
-                            await ws.send(f.read())
-                        await ws.send("done")
-                    client.current_round += 1
+                    # Start emissions tracker
+                    tracker = EmissionsTracker(
+                        project_name=f"client_{client.client_id}_round",
+                        save_to_file=False,
+                        log_level="error"
+                    )
+                    await asyncio.to_thread(tracker.start)
+                    start_time = time.perf_counter()
 
-                elif msg == "train_fv":
-                    # --- ROUTINE B: PURE GRADIENT CONFLICT STRATEGIES (FedFV) ---
-                    print(f"[{client.client_id}] Gradient FedFV execution")
-                    model_bytes = await ws.recv()
-                    if isinstance(model_bytes, str): model_bytes = model_bytes.encode('utf-8')
-                    model_path = f"models/global_model_{client.client_id}.keras"
-                    with open(model_path, "wb") as f: f.write(model_bytes)
-                    client.model.model.load_weights(model_path)
+                    # Train locally for 1 epoch
+                    await asyncio.to_thread(client.model.train, 1)
 
-                    async with training_lock:
-                        # Extract un-Adamized raw structural updates using custom local loops
-                        local_grads, current_loss = await asyncio.to_thread(client.model.train_local_gradients_fv)
-                        
+                    comp_latency = time.perf_counter() - start_time
+                    await asyncio.to_thread(tracker.stop)
+                    actual_energy_joules = tracker._total_energy.kWh * 3.6e6 if tracker._total_energy else 0.0
+
+                    # Save local trained model
+                    client_model_path = f"models/client_{client.client_id}_model.keras"
+                    client.model.model.save(client_model_path)
+                    
+                    # 2. Upload local model weights directly to S3
+                    upload_start = time.perf_counter()
+                    with open(client_model_path, "rb") as f:
+                        upload_resp = requests.put(upload_url, data=f)
+                    upload_resp.raise_for_status()
+                    upload_latency = time.perf_counter() - upload_start
+                    
+                    print(f"Upload status: {upload_resp.status_code} | Download: {download_latency:.4f}s | Upload: {upload_latency:.4f}s")
+                    
+                    # Send completion confirmation to server via WebSocket
                     payload = {
-                            "gradients": [g.tolist() for g in local_grads],
-                            "loss": current_loss,
-                            "samples": client.samples
-                        }
+                        "status": "done",
+                        "s3_key": extract_s3_key(upload_url),
+                        "samples": client.samples,
+                        "loss": train_loss,
+                        "comp_latency": comp_latency,
+                        "measured_energy": actual_energy_joules,
+                        "download_latency": download_latency
+                    }
                     await ws.send(json.dumps(payload))
-                        
-                        # Receive resolved steps back and apply manually
-                    server_response = await ws.recv()
-                    global_gradients = json.loads(server_response)
-                    async with training_lock:
-                        await asyncio.to_thread(client.model.apply_global_gradients_fv, global_gradients, server_lr=0.001)
-                    
                     client.current_round += 1
+
+                elif command == "train_fv":
+                    print(f"[{client.client_id}] selected for FedFV gradient training.")
+                    download_url = event["download_url"]
+                    upload_url = event["upload_url"]
+
+                    # 1. Download global model weights from S3
+                    download_start = time.perf_counter()
+                    response = requests.get(download_url)
+                    response.raise_for_status()
+                    download_latency = time.perf_counter() - download_start
                     
-                elif msg == "eval":
-                    print(f"[{client.client_id}] starting evaluation")
-                    model_bytes = await ws.recv()
-                    if isinstance(model_bytes, str):
-                        model_bytes = model_bytes.encode('utf-8')
                     model_path = f"models/global_model_{client.client_id}.keras"
                     with open(model_path, "wb") as f:
-                        f.write(model_bytes)
+                        f.write(response.content)
+                        
+                    client.model.model.load_weights(model_path)
+
+                    # Start emissions tracker
+                    tracker = EmissionsTracker(
+                        project_name=f"client_{client.client_id}_round",
+                        save_to_file=False,
+                        log_level="error"
+                    )
+                    await asyncio.to_thread(tracker.start)
+                    start_time = time.perf_counter()
+
+                    # Extract un-Adamized local gradients
+                    local_grads, current_loss = await asyncio.to_thread(client.model.train_local_gradients_fv)
+
+                    comp_latency = time.perf_counter() - start_time
+                    await asyncio.to_thread(tracker.stop)
+                    actual_energy_joules = tracker._total_energy.kWh * 3.6e6 if tracker._total_energy else 0.0
+                    
+                    # Save gradients into binary .npz file
+                    local_npz_path = f"models/client_{client.client_id}_gradients.npz"
+                    np.savez_compressed(local_npz_path, *local_grads)
+                    
+                    # 2. Upload local gradients directly to S3
+                    upload_start = time.perf_counter()
+                    with open(local_npz_path, "rb") as f:
+                        upload_resp = requests.put(upload_url, data=f)
+                    upload_resp.raise_for_status()
+                    upload_latency = time.perf_counter() - upload_start
+                    
+                    print(f"Gradients upload status: {upload_resp.status_code} | Comp: {comp_latency:.4f}s")
+                    
+                    # Send completion confirmation to server via WebSocket
+                    payload = {
+                        "status": "done",
+                        "s3_key": extract_s3_key(upload_url),
+                        "samples": client.samples,
+                        "loss": current_loss,
+                        "comp_latency": comp_latency,
+                        "measured_energy": actual_energy_joules,
+                        "download_latency": download_latency
+                    }
+                    await ws.send(json.dumps(payload))
+                    
+                    # Wait for global gradients response back from server
+                    msg_text_grads = await ws.recv()
+                    event_grads = json.loads(msg_text_grads)
+                    
+                    if event_grads.get("command") == "apply_gradients":
+                        global_gradients = event_grads["global_gradients"]
+                        await asyncio.to_thread(client.model.apply_global_gradients_fv, global_gradients, server_lr=0.001)
+                        print(f"[{client.client_id}] Applied global gradients resolved from FedFV.")
+                        
+                    client.current_round += 1
+                    
+                elif command == "eval":
+                    print(f"[{client.client_id}] starting evaluation.")
+                    download_url = event["download_url"]
+                    
+                    # Download global model weights from S3
+                    response = requests.get(download_url)
+                    response.raise_for_status()
+                    model_path = f"models/global_model_{client.client_id}.keras"
+                    with open(model_path, "wb") as f:
+                        f.write(response.content)
+                        
                     client.model.model.load_weights(model_path)
                     
-                    async with training_lock:
-                        local_met = await asyncio.to_thread(client.model.evaluate)
-                        client.local_metrics_history.append(local_met)
+                    # Evaluate locally
+                    local_met = await asyncio.to_thread(client.model.evaluate)
+                    client.local_metrics_history.append(local_met)
 
-                    await ws.send("EVAL")
-                    await ws.send(str(client.samples))
-                    await ws.send(json.dumps(local_met))
-                elif msg == "metrics":
-                    metrics_str = await ws.recv()
+                    # Send evaluation results to server
+                    payload = {
+                        "status": "evaluated",
+                        "samples": client.samples,
+                        "metrics": local_met
+                    }
+                    await ws.send(json.dumps(payload))
+                    
+                elif command == "metrics":
+                    metrics_str = event["payload"]
                     global_met = json.loads(metrics_str)
                     client.global_metrics_history.append(global_met)
-                    print(f"[{client.client_id}] received global metrics")
-                elif msg == "wait":
-                    print(f"[{client.client_id}] Not selected")
-                elif msg == "exit":
-                    print(f"[{client.client_id}] Finished Training and Evaluation")
+                    print(f"[{client.client_id}] received global metrics.")
+                    
+                elif command == "wait":
+                    print(f"[{client.client_id}] Not selected.")
+                    
+                elif command == "exit":
+                    print(f"[{client.client_id}] Finished Training and Evaluation.")
                     client.plot_metrics()
                     return
+                    
     except websockets.exceptions.ConnectionClosed:
         print(f"[Client {client.client_id}] Server closed the connection.")
 
 
 async def main():
-    clients = []
-    n = 10
-    for i in range(n): #no of sequential clients
-        path = args.dataset + f"{i}.npz"
-        client = Client(path)
-        clients.append(client)
-    
-    tasks = [simulate(client) for client in clients]
-    await asyncio.gather(*tasks)
+    client = Client(args.dataset, args.client_id, args.password, args.no_verify)
+    await simulate(client)
 
 if __name__ == "__main__":
     asyncio.run(main())
